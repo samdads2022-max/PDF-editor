@@ -3,215 +3,239 @@ import fitz  # PyMuPDF
 from io import BytesIO
 import os
 
-# --- 1. 全局配置 (必须放在第一行) ---
-st.set_page_config(page_title="PDF 全能工具箱", layout="wide")
+# --- 1. 全局配置 ---
+st.set_page_config(page_title="PDF 编辑器 (多页叠加版)", layout="wide")
 
-# --- 2. 全局常量与辅助函数 ---
+# --- 2. 常量定义 ---
 
-# 字体配置
-FONTS_MAP = {
-    "默认黑体": "fonts/simhei.ttf",
-    "标准楷体": "fonts/simkai.ttf",
-    "标准宋体": "fonts/simsun.ttc", # 注意这里是 ttc
-    "Times New Roman": "fonts/times.ttf" 
+# Word 字号对照表 (pt)
+WORD_FONT_SIZES = {
+    "初号": 42, "小初": 36,
+    "一号": 26, "小一": 24,
+    "二号": 22, "小二": 18,
+    "三号": 16, "小三": 15,
+    "四号": 14, "小四": 12,
+    "五号": 10.5, "小五": 9,
+    "六号": 7.5, "小六": 6.5,
+    "七号": 5.5, "八号": 5
 }
 
-# 获取有效字体列表
+# 字体路径配置 (请确保 GitHub/本地 有对应文件)
+# 建议使用方法一：把字体文件放在和 app.py 同级目录，这里直接写文件名
+FONTS_MAP = {
+    "默认黑体": "simhei.ttf",
+    "标准楷体": "simkai.ttf",
+    "标准宋体": "simsun.ttc",
+    "Times New Roman": "times.ttf"
+}
+
+# --- 3. 辅助函数 ---
+
 def get_available_fonts():
+    """只返回存在的字体"""
     available = {}
     for name, path in FONTS_MAP.items():
+        # 兼容两种路径：fonts/xxx.ttf 或 xxx.ttf
         if os.path.exists(path):
             available[name] = path
+        elif os.path.exists(f"fonts/{path}"):
+            available[name] = f"fonts/{path}"
     return available
 
-# 解析页码字符串 (例如 "1, 3-5")
-def parse_page_selection(page_str, max_page):
-    selected_pages = set()
-    try:
-        parts = page_str.replace("，", ",").split(",") 
-        for part in parts:
-            part = part.strip()
-            if not part: continue
-            if "-" in part: 
-                start, end = map(int, part.split("-"))
-                start = max(1, start)
-                end = min(max_page, end)
-                for p in range(start, end + 1):
-                    selected_pages.add(p - 1)
-            else: 
-                p = int(part)
-                if 1 <= p <= max_page:
-                    selected_pages.add(p - 1)
-        return sorted(list(selected_pages))
-    except:
-        return []
+# --- 4. 初始化 Session State (关键！用于记忆历史操作) ---
+if 'history' not in st.session_state:
+    st.session_state['history'] = []  # 存储所有添加的文字记录
 
-# --- 3. 侧边栏导航 ---
-st.sidebar.title("🛠️ PDF 工具箱")
-mode = st.sidebar.radio("请选择功能：", ["🖊️ 编辑文字", "🖇️ 合并 PDF", "✂️ 拆分/删除页面"])
+# --- 5. 主程序 ---
+st.title("📄 PDF 编辑器 (支持多页、多位置、Word字号)")
 
-# ========================================================
-# 模式一：编辑文字
-# ========================================================
-if mode == "🖊️ 编辑文字":
-    st.title("🖊️ PDF 编辑器 ")
-    
-    # 侧边栏：文件与字体设置
-    st.sidebar.header("1. 文件设置")
-    uploaded_file = st.file_uploader("上传 PDF", type=["pdf"], key="edit_uploader")
+# 侧边栏：文件上传
+with st.sidebar:
+    st.header("1. 文件与字体")
+    uploaded_file = st.file_uploader("上传 PDF", type=["pdf"])
     
     available_fonts = get_available_fonts()
-    current_font_path = None
-
     if not available_fonts:
-        st.sidebar.warning("⚠️ fonts文件夹下未检测到字体，中文将无法显示。")
+        st.error("⚠️ 未检测到字体文件，中文将显示乱码或无法运行！")
+        current_font_path = None
     else:
-        st.sidebar.header("2. 字体选择")
-        selected_font_name = st.sidebar.selectbox("选择字体", list(available_fonts.keys()))
+        selected_font_name = st.selectbox("选择字体", list(available_fonts.keys()))
         current_font_path = available_fonts[selected_font_name]
 
-    # 主体逻辑
-    if uploaded_file is not None:
-        pdf_bytes = uploaded_file.read()
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        total_pages = len(doc)
-
-        col1, col2 = st.columns([1, 2])
+# 主界面逻辑
+if uploaded_file is not None:
+    # 读取文件流
+    pdf_bytes = uploaded_file.read()
+    
+    # 我们需要两个 doc 对象：
+    # 1. doc_preview: 用于在屏幕上显示（包含历史记录 + 当前正在调整的预览文字）
+    # 2. doc_final: 用于下载（包含历史记录）
+    
+    # 先打开一个基础文档用于获取信息
+    doc_base = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(doc_base)
+    
+    col1, col2 = st.columns([1, 2])
+    
+    # --- 左侧：编辑控制区 ---
+    with col1:
+        st.subheader("🛠️ 编辑操作台")
         
-        # 左侧：编辑参数
-        with col1:
-            st.subheader("内容编辑")
-            page_number = st.number_input("选择页码", min_value=1, max_value=total_pages, value=1)
-            page_index = page_number - 1
-            page = doc[page_index]
-            page_w = page.rect.width
-            page_h = page.rect.height
-
-            text_input = st.text_area("输入文字 (回车换行)", "在这里输入文字...", height=100)
+        # 1. 页面选择
+        page_num = st.number_input("当前操作页码", 1, total_pages, 1)
+        current_page_index = page_num - 1
+        
+        # 获取当前页尺寸，用于滑块范围
+        page_ref = doc_base[current_page_index]
+        page_w = page_ref.rect.width
+        page_h = page_ref.rect.height
+        
+        st.markdown("---")
+        
+        # 2. 文本内容与样式
+        input_text = st.text_area("输入文字内容", "点击此处输入...", height=80)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            # 使用 Word 字号选择器
+            size_name = st.selectbox("字号大小", list(WORD_FONT_SIZES.keys()), index=9) # 默认选中"四号"
+            font_size = WORD_FONT_SIZES[size_name]
             
-            c1, c2 = st.columns(2)
-            with c1:
-                font_size = st.number_input("字号", value=30)
-                line_spacing = st.slider("行间距", 0.8, 3.0, 1.2, 0.1)
-            with c2:
-                color_hex = st.color_picker("颜色", "#FF0000")
-                r = int(color_hex[1:3], 16) / 255
-                g = int(color_hex[3:5], 16) / 255
-                b = int(color_hex[5:7], 16) / 255
+            line_spacing = st.slider("行间距", 0.8, 3.0, 1.2, 0.1)
+        with c2:
+            color_hex = st.color_picker("文字颜色", "#000000") # 默认黑色
+            
+        # 颜色转换
+        r = int(color_hex[1:3], 16) / 255
+        g = int(color_hex[3:5], 16) / 255
+        b = int(color_hex[5:7], 16) / 255
+        
+        st.markdown("---")
+        
+        # 3. 位置定位
+        st.write("📍 **调整位置**")
+        pos_x = st.slider("横向位置 (X)", 0.0, page_w, 50.0)
+        pos_y = st.slider("纵向位置 (Y)", 0.0, page_h, 100.0)
+        
+        st.markdown("---")
+        
+        # 4. 动作按钮
+        btn_col1, btn_col2 = st.columns(2)
+        
+        # 确认添加按钮
+        if btn_col1.button("➕ 确认添加"):
+            if input_text and current_font_path:
+                # 把当前的所有参数打包存入 session_state
+                new_edit = {
+                    "page": current_page_index,
+                    "text": input_text,
+                    "x": pos_x,
+                    "y": pos_y,
+                    "font_path": current_font_path,
+                    "size": font_size,
+                    "color": (r, g, b),
+                    "line_spacing": line_spacing
+                }
+                st.session_state['history'].append(new_edit)
+                st.success("已添加！可更换位置继续添加。")
+                st.rerun() # 强制刷新页面以更新预览
 
-            x_pos = st.slider("X 轴位置", 0.0, page_w, 50.0)
-            y_pos = st.slider("Y 轴位置", 0.0, page_h, 100.0)
-
-        # 绘制逻辑
-        def draw_multiline_text(page_obj):
-            if not text_input: return
-            font_key = "custom_font"
-            # 只有当字体路径存在时才注册
-            if current_font_path:
-                page_obj.insert_font(fontname=font_key, fontfile=current_font_path)
-                final_font = font_key
+        # 撤销按钮
+        if btn_col2.button("↩️ 撤销上一步"):
+            if st.session_state['history']:
+                st.session_state['history'].pop()
+                st.warning("已撤销最后一次操作")
+                st.rerun()
             else:
-                final_font = "helv" # 默认英文字体
+                st.info("没有可撤销的操作")
 
-            lines = text_input.split('\n')
-            current_y = y_pos
-            for line in lines:
-                page_obj.insert_text(
-                    (x_pos, current_y),
-                    line,
-                    fontsize=font_size,
-                    fontname=final_font,
-                    color=(r, g, b)
-                )
-                current_y += font_size * line_spacing
+        # 显示已添加的列表（简略）
+        if st.session_state['history']:
+            st.markdown(f"📊 **当前已添加 {len(st.session_state['history'])} 处文本**")
+            with st.expander("查看所有编辑记录"):
+                for i, edit in enumerate(st.session_state['history']):
+                    st.text(f"{i+1}. 第{edit['page']+1}页: {edit['text'][:10]}...")
 
-        draw_multiline_text(page)
-
-        # 右侧：预览
-        with col2:
-            st.subheader("预览")
-            pix = page.get_pixmap(dpi=150)
-            st.image(pix.tobytes(), use_container_width=True)
-
-        # 导出
-        st.sidebar.markdown("---")
-        output_buffer = BytesIO()
-        doc.save(output_buffer)
-        output_buffer.seek(0)
-        st.sidebar.download_button("📥 下载结果", output_buffer, "edited.pdf", "application/pdf")
+    # --- 右侧：实时渲染逻辑 ---
     
-    else:
-        st.info("请在左侧上传 PDF 文件。")
+    # 函数：将单次编辑应用到页面上
+    def apply_edit_to_page(page_obj, edit_data):
+        # 注册字体
+        font_key = "custom_" + os.path.basename(edit_data['font_path'])
+        page_obj.insert_font(fontname=font_key, fontfile=edit_data['font_path'])
+        
+        # 绘制
+        lines = edit_data['text'].split('\n')
+        cy = edit_data['y']
+        for line in lines:
+            page_obj.insert_text(
+                (edit_data['x'], cy),
+                line,
+                fontname=font_key,
+                fontsize=edit_data['size'],
+                color=edit_data['color']
+            )
+            cy += edit_data['size'] * edit_data['line_spacing']
 
-# ========================================================
-# 模式二：合并 PDF
-# ========================================================
-elif mode == "🖇️ 合并 PDF":
-    st.title("🖇️ PDF 合并工具")
+    # 1. 准备预览用的文档
+    # 必须每次重新从 bytes 打开，保证底板是干净的
+    doc_preview = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    uploaded_files = st.file_uploader("请按顺序上传多个 PDF", type=["pdf"], accept_multiple_files=True, key="merge_uploader")
-
-    if uploaded_files and len(uploaded_files) > 1:
-        st.success(f"已选中 {len(uploaded_files)} 个文件。")
-        if st.button("开始合并"):
-            merged_doc = fitz.open()
-            for file in uploaded_files:
-                file_bytes = file.read()
-                with fitz.open(stream=file_bytes, filetype="pdf") as temp_doc:
-                    merged_doc.insert_pdf(temp_doc)
+    # 2. 先把历史记录画上去
+    for edit in st.session_state['history']:
+        # 只处理存在的页码
+        if edit['page'] < len(doc_preview):
+            apply_edit_to_page(doc_preview[edit['page']], edit)
             
-            out_buf = BytesIO()
-            merged_doc.save(out_buf)
-            out_buf.seek(0)
-            st.download_button("📥 下载合并后文件", out_buf, "merged.pdf", "application/pdf")
-    elif uploaded_files:
-        st.warning("请至少上传 2 个文件。")
+    # 3. 再把“当前正在调整”的预览画上去（仅画在当前页，标红显示，方便定位）
+    if input_text and current_font_path:
+        # 为了区分，预览状态我们稍微用个半透明或者亮色边框（fitz不支持透明文字，我们用红色替代）
+        # 这里完全模拟真实效果，但使用红色，提示用户这是"未保存"的状态
+        preview_edit = {
+            "page": current_page_index,
+            "text": input_text,
+            "x": pos_x,
+            "y": pos_y,
+            "font_path": current_font_path,
+            "size": font_size,
+            "color": (1, 0, 0), # 红色预览
+            "line_spacing": line_spacing
+        }
+        apply_edit_to_page(doc_preview[current_page_index], preview_edit)
+        
+    with col2:
+        st.subheader(f"👀 效果预览 (第 {page_num} 页)")
+        st.caption("红色文字为当前预览位置，点击左侧【确认添加】后变为黑色并固定。")
+        
+        # 渲染当前页
+        preview_page = doc_preview[current_page_index]
+        pix = preview_page.get_pixmap(dpi=150)
+        st.image(pix.tobytes(), use_container_width=True)
 
-# ========================================================
-# 模式三：拆分与删除
-# ========================================================
-elif mode == "✂️ 拆分/删除页面":
-    st.title("✂️ 页面管理")
+    # --- 侧边栏：最终下载 ---
+    st.sidebar.markdown("---")
+    st.sidebar.header("2. 导出文件")
     
-    uploaded_file = st.file_uploader("上传 PDF", type=["pdf"], key="split_uploader")
-    
-    if uploaded_file:
-        file_bytes = uploaded_file.read()
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        total_pages = len(doc)
+    if st.sidebar.button("💾 生成最终 PDF"):
+        # 重新生成一个干净的 doc 用于保存，不包含红色的预览字
+        doc_final = fitz.open(stream=pdf_bytes, filetype="pdf")
         
-        st.info(f"文档共 {total_pages} 页。")
+        # 写入历史记录
+        for edit in st.session_state['history']:
+            if edit['page'] < len(doc_final):
+                apply_edit_to_page(doc_final[edit['page']], edit)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            action = st.radio("操作模式", ["删除指定页", "仅提取保留指定页"])
-        with col2:
-            page_input = st.text_input("输入页码 (如: 1, 3-5)", "1")
+        out_buffer = BytesIO()
+        doc_final.save(out_buffer)
+        out_buffer.seek(0)
         
-        selected_indices = parse_page_selection(page_input, total_pages)
-        human_readable = [p+1 for p in selected_indices]
+        st.sidebar.download_button(
+            label="📥 下载 PDF 文件",
+            data=out_buffer,
+            file_name="finished_document.pdf",
+            mime="application/pdf"
+        )
         
-        if selected_indices:
-            st.write(f"选中页码: {human_readable}")
-            if st.button("执行操作"):
-                if action == "仅提取保留指定页":
-                    doc.select(selected_indices)
-                    msg = "提取成功"
-                else:
-                    # 计算剩余页面的索引
-                    all_indices = set(range(total_pages))
-                    keep = sorted(list(all_indices - set(selected_indices)))
-                    if not keep:
-                        st.error("不能删除所有页面！")
-                        st.stop()
-                    doc.select(keep)
-                    msg = "删除成功"
-                
-                out_buf = BytesIO()
-                doc.save(out_buf)
-                out_buf.seek(0)
-                st.success(f"{msg}！当前剩余 {len(doc)} 页。")
-                st.download_button("📥 下载结果", out_buf, "processed.pdf", "application/pdf")
-        else:
+else:
+    st.info("请在左侧上传 PDF 文件以开始编辑。")
 
-            st.warning("请输入有效的页码。")
